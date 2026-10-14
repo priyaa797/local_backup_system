@@ -135,7 +135,77 @@ If multiple backup runs take place on the same day, earlier backups are preserve
 
 ## 📦 Packaging the Windows Executable (`.exe`)
 
-A dedicated build script `build_windows.bat` is included for repeatable Windows builds:
+### Automated Releases via GitHub Actions
+
+This repository includes a continuous delivery workflow at [`.github/workflows/release-windows.yml`](file:///.github/workflows/release-windows.yml) that automatically builds, tests, packages, and releases a genuine Windows standalone executable on a `windows-latest` runner whenever a version tag matching `v*` is pushed.
+
+#### Creating and Publishing a Release:
+
+```bash
+# 1. Ensure working directory is clean and up to date on main
+git checkout main
+git pull origin main
+
+# 2. Tag the release version (e.g. v1.0.0)
+git tag -a v1.0.0 -m "Release v1.0.0: Automated Local Backup System for Windows"
+
+# 3. Push the tag to GitHub
+git push origin v1.0.0
+```
+
+The workflow will:
+1. Set up Python 3.12 on a Windows runner.
+2. Install all dependencies from `requirements.txt`.
+3. Execute the full test suite (`pytest tests/`). The build halts immediately if any test fails.
+4. Verify that the tag has not already been published to prevent unintentional overwrites.
+5. Compile `dist\LocalBackupSystem.exe` using `local_backup_system.spec`.
+6. Validate that the executable exists and meets size requirements (>30 MB).
+7. Package `LocalBackupSystem-Windows-x64.zip` with `README.md` and calculate SHA-256 checksums (`SHA256SUMS.txt`).
+8. Publish an official GitHub Release with release assets:
+   - `LocalBackupSystem.exe` (standalone executable)
+   - `LocalBackupSystem-Windows-x64.zip` (complete portable package)
+   - `SHA256SUMS.txt` (cryptographic verification hashes)
+
+#### Manual Workflow Trigger (`workflow_dispatch`):
+You can also run the workflow manually from the **Actions** tab on GitHub:
+- If triggered on a branch (e.g. `main`), the workflow builds and tests the executable and uploads it as a workflow artifact named `LocalBackupSystem-Windows-x64` for testing without publishing an untagged production release.
+
+---
+
+### Required GitHub Repository Permissions
+
+To allow GitHub Actions to publish releases, verify that write permissions are enabled:
+1. Navigate to your repository on GitHub: `Settings` → `Actions` → `General`.
+2. Under **Workflow permissions**, select **Read and write permissions**.
+3. Check the box for **Allow GitHub Actions to create and approve pull requests** (optional, recommended).
+4. Click **Save**.
+
+---
+
+### Downloading and Running on Another Windows PC
+
+1. **Download**: Go to the **Releases** section of your GitHub repository and download either:
+   - `LocalBackupSystem-Windows-x64.zip` (recommended, includes documentation), or
+   - `LocalBackupSystem.exe` (standalone direct executable).
+2. **Verify Checksum (Optional)**:
+   In PowerShell on the target machine:
+   ```powershell
+   Get-FileHash -Path .\LocalBackupSystem.exe -Algorithm SHA256
+   ```
+   Compare the output hash against `SHA256SUMS.txt`.
+3. **Extract & Run**:
+   - Extract the ZIP archive (or place `LocalBackupSystem.exe` in a convenient folder, e.g. `C:\Users\<User>\Desktop` or `C:\LocalBackupSystem`).
+   - Double-click `LocalBackupSystem.exe`.
+4. **Windows SmartScreen Note**:
+   - Because the executable is built without an expensive commercial code-signing certificate, Windows Defender SmartScreen may display: *"Windows protected your PC"*.
+   - Click **More info**, then click **Run anyway**.
+   - The application does not require Administrator privileges and stores all user data safely in `%LOCALAPPDATA%\LocalBackupSystem`.
+
+---
+
+### Local Build Script (`build_windows.bat`)
+
+For developers building on a local Windows machine, the batch script `build_windows.bat` packages the executable and creates the distribution ZIP locally:
 
 ```cmd
 build_windows.bat
@@ -146,7 +216,7 @@ The script will:
 2. Install packaging dependencies.
 3. Run the automated test suite to verify code integrity.
 4. Execute PyInstaller using `local_backup_system.spec`.
-5. Output the standalone binary to `dist\LocalBackupSystem.exe`.
+5. Package `dist\LocalBackupSystem-Windows-x64.zip` and generate `dist\SHA256SUMS.txt`.
 
 ---
 

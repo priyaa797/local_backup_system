@@ -53,6 +53,16 @@ if exist "dist\LocalBackupSystem.exe" (
     echo Binary Location: dist\LocalBackupSystem.exe
     echo ======================================================================
     echo.
+
+    :: Create ZIP distribution package
+    echo Packaging distribution archive...
+    powershell -NoProfile -Command ^
+        "$dist = 'dist'; $pkg = '$dist\LocalBackupSystem-Windows-x64'; New-Item -ItemType Directory -Force -Path $pkg | Out-Null; Copy-Item '$dist\LocalBackupSystem.exe' $pkg; Copy-Item 'README.md' $pkg; Compress-Archive -Path '$pkg\*' -DestinationPath '$dist\LocalBackupSystem-Windows-x64.zip' -Force; (Get-FileHash '$dist\LocalBackupSystem.exe' -Algorithm SHA256).Hash.ToLower() + '  LocalBackupSystem.exe`n' + (Get-FileHash '$dist\LocalBackupSystem-Windows-x64.zip' -Algorithm SHA256).Hash.ToLower() + '  LocalBackupSystem-Windows-x64.zip' | Out-File -FilePath '$dist\SHA256SUMS.txt' -Encoding ascii"
+
+    if exist "dist\LocalBackupSystem-Windows-x64.zip" (
+        echo [INFO] Distribution package: dist\LocalBackupSystem-Windows-x64.zip
+        echo [INFO] Checksums recorded in: dist\SHA256SUMS.txt
+    )
 ) else (
     echo.
     echo [ERROR] Build completed but dist\LocalBackupSystem.exe was not found.

@@ -1,0 +1,133 @@
+name: Build and Release Windows Executable
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Package Windows Executable
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run automated test suite
+        run: |
+          python -m pytest tests/ -v --strict-markers
+
+      - name: Prevent unintentional release overwrite
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "::error::Release for tag '$TAG_NAME' already exists! Aborting workflow to prevent overwriting existing release."
+            exit 1
+          fi
+          echo "Verified: Tag '$TAG_NAME' does not already have an existing GitHub Release."
+
+      - name: Build Windows executable with PyInstaller
+        run: |
+          pyinstaller --clean -y local_backup_system.spec
+
+      - name: Validate built executable artifact
+        shell: pwsh
+        run: |
+          $exePath = "dist\LocalBackupSystem.exe"
+          if (-not (Test-Path $exePath)) {
+            Write-Error "Validation failed: '$exePath' was not found after PyInstaller build!"
+            exit 1
+          }
+          $item = Get-Item $exePath
+          $fileSize = $item.Length
+          $minSize = 30 * 1024 * 1024  # 30 MB minimum for PySide6 standalone executable
+          if ($fileSize -lt $minSize) {
+            Write-Error "Validation failed: '$exePath' size ($([math]::Round($fileSize / 1MB, 2)) MB) is below the expected minimum ($([math]::Round($minSize / 1MB, 2)) MB)."
+            exit 1
+          }
+          Write-Host "Executable validation passed: '$exePath' exists with size $([math]::Round($fileSize / 1MB, 2)) MB."
+
+      - name: Package distribution ZIP and compute checksums
+        shell: pwsh
+        run: |
+          $distDir = "dist"
+          $stagingDir = "$distDir\LocalBackupSystem-Windows-x64"
+          New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
+
+          Copy-Item "$distDir\LocalBackupSystem.exe" -Destination "$stagingDir\"
+          Copy-Item "README.md" -Destination "$stagingDir\"
+          if (Test-Path "assets\icon.png") {
+            Copy-Item "assets\icon.png" -Destination "$stagingDir\"
+          }
+
+          $zipPath = "$distDir\LocalBackupSystem-Windows-x64.zip"
+          Compress-Archive -Path "$stagingDir\*" -DestinationPath $zipPath -Force
+
+          # Compute SHA-256 Checksums
+          $exeHash = (Get-FileHash -Path "$distDir\LocalBackupSystem.exe" -Algorithm SHA256).Hash.ToLower()
+          $zipHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
+
+          $checksums = "$exeHash  LocalBackupSystem.exe`n$zipHash  LocalBackupSystem-Windows-x64.zip"
+          Set-Content -Path "$distDir\SHA256SUMS.txt" -Value $checksums -Encoding ascii
+
+          Write-Host "Generated SHA-256 Checksums:"
+          Write-Host $checksums
+
+      - name: Upload build artifacts to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalBackupSystem-Windows-x64
+          path: |
+            dist/LocalBackupSystem.exe
+            dist/LocalBackupSystem-Windows-x64.zip
+            dist/SHA256SUMS.txt
+          retention-days: 14
+
+      - name: Publish official GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/LocalBackupSystem.exe
+            dist/LocalBackupSystem-Windows-x64.zip
+            dist/SHA256SUMS.txt
+          name: Local Backup System ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log notice for untagged manual build
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        shell: bash
+        run: |
+          echo "======================================================================="
+          echo "NOTICE: Build completed successfully on untagged ref '${GITHUB_REF}'."
+          echo "The generated executable and ZIP package are available under the"
+          echo "workflow 'LocalBackupSystem-Windows-x64' artifact."
+          echo "To publish an official GitHub Release, push a version tag matching 'v*'"
+          echo "e.g., 'git tag v1.0.0 && git push origin v1.0.0'."
+          echo "======================================================================="
