@@ -238,6 +238,25 @@ class BackupCoordinator:
             transfer_svc = FileTransferService(ssh)
             self._active_transfer_service = transfer_svc
 
+            # Pre-validate all artifact paths before starting multi-gigabyte downloads
+            val_res = transfer_svc.validate_remote_artifacts(
+                artifacts=record.artifacts,
+                log_cb=self.log,
+            )
+            if isinstance(val_res, tuple) and len(val_res) == 2:
+                all_valid, val_err = val_res
+            else:
+                all_valid, val_err = True, None
+
+            if not all_valid:
+                self._fail_site(
+                    record,
+                    stage=BackupStage.DOWNLOADING_FILES,
+                    error_msg=val_err or "Pre-transfer validation failed for backup artifacts.",
+                    action="Verify bench directory path, site permissions, and remote filesystem integrity.",
+                )
+                return
+
             for artifact in record.artifacts:
                 if self._cancel_requested:
                     self._fail_site(record, BackupStage.DOWNLOADING_FILES, "Download cancelled.", "")

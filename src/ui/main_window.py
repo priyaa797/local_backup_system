@@ -82,7 +82,7 @@ class MainWindow(QMainWindow):
     def _update_status_bar(self) -> None:
         dest = self.settings_store.get_ssd_folder()
         dest_display = dest if dest else "No SSD destination configured"
-        self.status_bar.showMessage(f"Destination: {dest_display} | Local Backup System v1.0.2")
+        self.status_bar.showMessage(f"Destination: {dest_display} | Local Backup System v1.0.3")
 
     def _restore_geometry(self) -> None:
         geom_b64 = self.settings_store.get_settings().window_geometry

@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import time
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Tuple
 
 import paramiko
 
@@ -34,6 +34,61 @@ class FileTransferService:
     def cancel(self) -> None:
         """Signal ongoing transfer to abort immediately."""
         self._cancel_requested = True
+
+    def validate_remote_artifacts(
+        self,
+        artifacts: List[BackupArtifact],
+        log_cb: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """Verify that all artifacts exist on the remote server via SFTP stat before downloading.
+
+        Returns (True, None) if all artifacts exist, or (False, error_details) on failure.
+        """
+        if not artifacts:
+            return False, "No backup artifacts to download."
+
+        sftp = self.ssh.open_sftp()
+        try:
+            try:
+                sftp_cwd = sftp.normalize(".")
+            except Exception:
+                sftp_cwd = "unknown"
+
+            for art in artifacts:
+                try:
+                    st = sftp.stat(art.remote_path)
+                    actual_size = st.st_size if st.st_size is not None else art.size_bytes
+                    art.size_bytes = actual_size
+                    logger.info(
+                        "Pre-transfer check OK for %s (%d bytes) at '%s'",
+                        art.filename,
+                        actual_size,
+                        art.remote_path,
+                    )
+                    if log_cb:
+                        log_cb(f"Pre-transfer verified: {art.filename} ({actual_size} bytes)")
+                except Exception as exc:
+                    err_str = str(exc)
+                    errno_val = getattr(exc, "errno", None)
+                    if isinstance(exc, FileNotFoundError) or errno_val == 2 or "No such file" in err_str:
+                        reason = f"File missing at '{art.remote_path}' ([Errno 2] No such file)"
+                    elif errno_val == 13 or "Permission denied" in err_str:
+                        reason = f"Permission denied accessing '{art.remote_path}' ([Errno 13] Permission denied)"
+                    else:
+                        reason = f"SFTP stat error for '{art.remote_path}': {type(exc).__name__}: {exc}"
+
+                    diag = (
+                        f"Pre-transfer validation failed for {art.filename}: {reason} "
+                        f"(SFTP cwd: '{sftp_cwd}'). Aborting before download to prevent partial transfers."
+                    )
+                    logger.error(diag)
+                    art.status = "failed"
+                    art.error_message = diag
+                    return False, diag
+
+            return True, None
+        finally:
+            sftp.close()
 
     def download_artifact(
         self,
@@ -61,23 +116,54 @@ class FileTransferService:
                 pass
 
         logger.info(
-            "Starting download of %s (%d bytes) to %s",
+            "Starting download of %s (%d bytes) from remote path '%s' to '%s'",
             artifact.filename,
             artifact.size_bytes,
+            artifact.remote_path,
             part_local_path,
         )
 
         sftp = self.ssh.open_sftp()
         try:
-            # Check remote file attributes
+            try:
+                sftp_cwd = sftp.normalize(".")
+            except Exception:
+                sftp_cwd = "unknown"
+
+            # Check remote file attributes immediately before download
             try:
                 remote_stat = sftp.stat(artifact.remote_path)
-                total_bytes = remote_stat.st_size or artifact.size_bytes
+                total_bytes = remote_stat.st_size if remote_stat.st_size is not None else artifact.size_bytes
                 artifact.size_bytes = total_bytes
+                logger.info(
+                    "SFTP stat verified for %s (%d bytes) at '%s' (SFTP cwd: '%s')",
+                    artifact.filename,
+                    total_bytes,
+                    artifact.remote_path,
+                    sftp_cwd,
+                )
             except Exception as exc:
-                logger.error("Could not stat remote file %s: %s", artifact.remote_path, exc)
+                err_str = str(exc)
+                errno_val = getattr(exc, "errno", None)
+                if isinstance(exc, FileNotFoundError) or errno_val == 2 or "No such file" in err_str:
+                    err = (
+                        f"Remote file missing: SFTP stat failed for '{artifact.remote_path}' "
+                        f"(SFTP cwd: '{sftp_cwd}'): [Errno 2] No such file."
+                    )
+                elif errno_val == 13 or "Permission denied" in err_str:
+                    err = (
+                        f"Permission denied: SFTP stat failed for '{artifact.remote_path}' "
+                        f"(SFTP cwd: '{sftp_cwd}'): [Errno 13] Permission denied."
+                    )
+                else:
+                    err = (
+                        f"SFTP stat error for '{artifact.remote_path}' "
+                        f"(SFTP cwd: '{sftp_cwd}'): {type(exc).__name__}: {exc}"
+                    )
+
+                logger.error("Could not stat remote file %s: %s", artifact.remote_path, err)
                 artifact.status = "failed"
-                artifact.error_message = f"Remote file missing or unreadable: {exc}"
+                artifact.error_message = err
                 return False
 
             artifact.status = "downloading"

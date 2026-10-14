@@ -152,11 +152,9 @@ class FrappeBackupService:
             if match:
                 label = match.group(1).strip()
                 raw_path = match.group(2).strip()
-                clean_path = raw_path.lstrip("./")
-                if not clean_path.startswith("/"):
-                    clean_path = f"{bench_dir}/{clean_path}"
+                fname = PurePosixPath(raw_path.strip().rstrip("/")).name
+                clean_path = self._normalize_remote_path(raw_path, bench_dir, site_name, fname)
 
-                fname = PurePosixPath(clean_path).name
                 stdout_filenames.add(fname)
                 stdout_label_map[fname] = label
                 stdout_path_map[fname] = clean_path
@@ -168,7 +166,9 @@ class FrappeBackupService:
                     if fname.endswith((".sql.gz", ".sql", ".tar", ".tgz", ".tar.gz", ".json")):
                         stdout_filenames.add(fname)
                         if fname not in stdout_path_map:
-                            stdout_path_map[fname] = f"{remote_backups_dir}/{fname}"
+                            stdout_path_map[fname] = self._normalize_remote_path(
+                                raw_candidate, bench_dir, site_name, fname
+                            )
 
         # Extract backup run timestamp prefix (e.g. 20261014_181143)
         run_timestamp_prefix: Optional[str] = None
@@ -182,6 +182,18 @@ class FrappeBackupService:
         try:
             sftp = self.ssh.open_sftp()
             try:
+                try:
+                    sftp_cwd = sftp.normalize(".")
+                    logger.info("[%s] SFTP session ready. SFTP working directory: %s", site_name, sftp_cwd)
+                    if log_cb:
+                        log_cb(f"[{site_name}] SFTP working directory: {sftp_cwd}")
+                except Exception:
+                    sftp_cwd = "unknown"
+
+                logger.info("[%s] Inspecting remote backups directory: %s", site_name, remote_backups_dir)
+                if log_cb:
+                    log_cb(f"[{site_name}] Inspecting remote backup directory: {remote_backups_dir}")
+
                 file_attrs = sftp.listdir_attr(remote_backups_dir)
                 # Sort newest first by mtime
                 file_attrs.sort(key=lambda a: a.st_mtime or 0, reverse=True)
@@ -225,9 +237,10 @@ class FrappeBackupService:
 
                 # Build artifact objects
                 for fname in candidate_names:
-                    full_remote = stdout_path_map.get(fname, f"{remote_backups_dir}/{fname}")
                     if fname in attr_by_name:
                         attr = attr_by_name[fname]
+                        # Prefer the verified canonical path in remote_backups_dir
+                        full_remote = f"{remote_backups_dir}/{attr.filename}"
                         art = self._classify_artifact(
                             filename=attr.filename,
                             remote_path=full_remote,
@@ -235,6 +248,10 @@ class FrappeBackupService:
                             label=stdout_label_map.get(attr.filename),
                         )
                     else:
+                        full_remote = stdout_path_map.get(
+                            fname,
+                            self._normalize_remote_path("", bench_dir, site_name, fname),
+                        )
                         logger.error(
                             "Expected backup artifact %s reported by bench was not found in %s",
                             fname,
@@ -248,8 +265,20 @@ class FrappeBackupService:
                         )
                         art.status = "failed"
                         art.error_message = (
-                            f"Remote backup artifact '{fname}' reported by bench was not found on server."
+                            f"Remote backup artifact '{fname}' reported by bench was not found on server at '{full_remote}'."
                         )
+
+                    logger.info(
+                        "[%s] Discovered artifact: %s (type: %s, size: %d bytes, remote_path: %s)",
+                        site_name,
+                        art.filename,
+                        art.artifact_type,
+                        art.size_bytes,
+                        art.remote_path,
+                    )
+                    if log_cb:
+                        log_cb(f"[{site_name}] Discovered artifact: {art.filename} ({art.size_bytes} bytes) -> {art.remote_path}")
+
                     artifacts.append(art)
 
             finally:
@@ -311,3 +340,51 @@ class FrappeBackupService:
             size_bytes=size,
             status="pending",
         )
+
+    @staticmethod
+    def _normalize_remote_path(
+        raw_path: str,
+        bench_dir: str,
+        site_name: str,
+        filename: str,
+    ) -> str:
+        """Resolve a raw path from bench stdout to an absolute remote path.
+
+        Handles variants:
+        - ./site/private/backups/file -> <bench_dir>/sites/site/private/backups/file
+        - ./sites/site/private/backups/file -> <bench_dir>/sites/site/private/backups/file
+        - /absolute/path/to/sites/site/private/backups/file -> preserved as-is
+        - private/backups/file -> <bench_dir>/sites/site/private/backups/file
+        - file -> <bench_dir>/sites/site/private/backups/file
+        """
+        bench_clean = bench_dir.rstrip("/")
+        site_clean = site_name.strip()
+        default_canonical = f"{bench_clean}/sites/{site_clean}/private/backups/{filename}"
+
+        if not raw_path:
+            return default_canonical
+
+        stripped = raw_path.strip()
+        while stripped.startswith("./"):
+            stripped = stripped[2:]
+
+        if stripped.startswith("/"):
+            # Check if it's missing /sites/ e.g. /root/frappe-bench/riya-associate.com/...
+            bench_site_prefix = f"{bench_clean}/{site_clean}/"
+            if stripped.startswith(bench_site_prefix) and f"{bench_clean}/sites/" not in stripped:
+                return f"{bench_clean}/sites/{stripped[len(bench_clean) + 1:]}"
+            return stripped
+
+        if stripped.startswith("sites/"):
+            return f"{bench_clean}/{stripped}"
+
+        if stripped.startswith(f"{site_clean}/"):
+            return f"{bench_clean}/sites/{stripped}"
+
+        if stripped.startswith("private/backups/"):
+            return f"{bench_clean}/sites/{site_clean}/{stripped}"
+
+        if stripped == filename:
+            return default_canonical
+
+        return f"{bench_clean}/sites/{site_clean}/private/backups/{filename}"

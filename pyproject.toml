@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-backup-system"
-version = "1.0.2"
+version = "1.0.3"
 description = "Automated secure Frappe / ERPNext local backup system for Windows desktop"
 authors = [{ name = "Local Backup System Team" }]
 readme = "README.md"
