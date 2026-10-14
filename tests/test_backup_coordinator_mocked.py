@@ -225,3 +225,277 @@ def test_coordinator_partial_success_run(mock_env):
                 assert failed_rec.status == JobStatus.FAILED
                 assert "timed out" in failed_rec.error_message
                 assert failed_rec.suggested_action is not None
+
+
+def test_coordinator_full_four_artifacts_workflow(mock_env):
+    """End-to-end verification of 4 artifacts (database, config, public files, private files)."""
+    import json
+    db, dest_dir = mock_env
+
+    s = ServerConfig(
+        host="server1.erp.com",
+        username="frappe",
+        site_name="riya-associate.com",
+        bench_path="/home/frappe/frappe-bench",
+    )
+    db.save_server(s)
+
+    coordinator = BackupCoordinator(db=db)
+
+    with patch("src.services.backup_coordinator.SSHService") as MockSSH:
+        mock_ssh = MagicMock()
+        mock_ssh.config = s
+        mock_ssh.connect.return_value = (True, "Connected")
+        mock_ssh.execute_command.return_value = (1, "", "")
+        MockSSH.return_value = mock_ssh
+
+        with patch("src.services.backup_coordinator.FrappeBackupService") as MockFrappe:
+            mock_frappe = MagicMock()
+            mock_frappe.ssh = mock_ssh
+            mock_frappe.config = s
+
+            # Simulate the 4 production artifacts
+            arts = [
+                BackupArtifact(
+                    filename="20261014_181143-riya-associate_com-site_config_backup.json",
+                    artifact_type="config",
+                    remote_path="/bench/sites/riya-associate.com/private/backups/20261014_181143-riya-associate_com-site_config_backup.json",
+                    size_bytes=518,
+                ),
+                BackupArtifact(
+                    filename="20261014_181143-riya-associate_com-database.sql.gz",
+                    artifact_type="database",
+                    remote_path="/bench/sites/riya-associate.com/private/backups/20261014_181143-riya-associate_com-database.sql.gz",
+                    size_bytes=34063064,
+                ),
+                BackupArtifact(
+                    filename="20261014_181143-riya-associate_com-files.tar",
+                    artifact_type="files",
+                    remote_path="/bench/sites/riya-associate.com/private/backups/20261014_181143-riya-associate_com-files.tar",
+                    size_bytes=1932735283,
+                ),
+                BackupArtifact(
+                    filename="20261014_181143-riya-associate_com-private-files.tar",
+                    artifact_type="private_files",
+                    remote_path="/bench/sites/riya-associate.com/private/backups/20261014_181143-riya-associate_com-private-files.tar",
+                    size_bytes=575248793,
+                ),
+            ]
+            mock_frappe.run_backup.return_value = (True, "Backup OK", arts)
+            MockFrappe.return_value = mock_frappe
+
+            with patch("src.services.backup_coordinator.FileTransferService") as MockTransfer:
+                mock_transfer = MagicMock()
+                mock_transfer.ssh = mock_ssh
+
+                def fake_download(artifact, destination_dir, progress_cb=None):
+                    lf = destination_dir / artifact.filename
+                    # Write small representative payload without allocating gigabytes in test
+                    lf.write_bytes(f"sample payload for {artifact.filename}".encode("utf-8"))
+                    artifact.local_path = str(lf)
+                    # Keep size_bytes reflecting the actual file for verification
+                    artifact.size_bytes = lf.stat().st_size
+                    artifact.status = "downloaded"
+                    return True
+
+                mock_transfer.download_artifact.side_effect = fake_download
+                MockTransfer.return_value = mock_transfer
+
+                job = coordinator.run_backup_job(
+                    destination_folder=str(dest_dir),
+                    servers_to_backup=[s],
+                )
+
+                assert job.status == JobStatus.SUCCESS
+                assert job.total_sites == 1
+                assert job.success_sites == 1
+                assert job.failed_sites == 0
+
+                rec = job.site_records[0]
+                assert rec.status == JobStatus.SUCCESS
+                assert len(rec.artifacts) == 4
+                assert "Full backup complete" in (rec.diagnostics or "")
+
+                # Verify manifest on disk
+                manifest_file = Path(rec.download_dir) / "backup_manifest.json"
+                assert manifest_file.exists()
+                manifest_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+
+                assert manifest_data["all_verified"] is True
+                assert manifest_data["total_artifacts"] == 4
+                assert manifest_data["has_database"] is True
+                assert manifest_data["has_files"] is True
+                assert manifest_data["has_private_files"] is True
+                assert manifest_data["has_config"] is True
+                assert manifest_data["is_complete_with_files"] is True
+                assert manifest_data["backup_type"] == "full"
+                assert len(manifest_data["artifacts"]) == 4
+
+
+def test_coordinator_fails_when_public_files_download_fails(mock_env):
+    """Job must FAIL if the public files archive fails to download."""
+    db, dest_dir = mock_env
+
+    s = ServerConfig(host="server1.erp.com", site_name="riya-associate.com")
+    db.save_server(s)
+
+    coordinator = BackupCoordinator(db=db)
+
+    with patch("src.services.backup_coordinator.SSHService") as MockSSH:
+        mock_ssh = MagicMock()
+        mock_ssh.config = s
+        mock_ssh.connect.return_value = (True, "Connected")
+        MockSSH.return_value = mock_ssh
+
+        with patch("src.services.backup_coordinator.FrappeBackupService") as MockFrappe:
+            mock_frappe = MagicMock()
+            arts = [
+                BackupArtifact(
+                    filename="20261014_181143-riya-associate_com-database.sql.gz",
+                    artifact_type="database",
+                    remote_path="/bench/sites/riya-associate.com/private/backups/db.sql.gz",
+                    size_bytes=34000000,
+                ),
+                BackupArtifact(
+                    filename="20261014_181143-riya-associate_com-files.tar",
+                    artifact_type="files",
+                    remote_path="/bench/sites/riya-associate.com/private/backups/files.tar",
+                    size_bytes=1900000000,
+                ),
+            ]
+            mock_frappe.run_backup.return_value = (True, "Backup OK", arts)
+            MockFrappe.return_value = mock_frappe
+
+            with patch("src.services.backup_coordinator.FileTransferService") as MockTransfer:
+                mock_transfer = MagicMock()
+
+                def fake_dl(artifact, destination_dir, progress_cb=None):
+                    if artifact.artifact_type == "files":
+                        artifact.status = "failed"
+                        artifact.error_message = "Connection reset by peer during 1.8 GiB download"
+                        return False
+                    lf = destination_dir / artifact.filename
+                    lf.write_bytes(b"dummy db data")
+                    artifact.local_path = str(lf)
+                    artifact.size_bytes = len(b"dummy db data")
+                    artifact.status = "downloaded"
+                    return True
+
+                mock_transfer.download_artifact.side_effect = fake_dl
+                MockTransfer.return_value = mock_transfer
+
+                job = coordinator.run_backup_job(
+                    destination_folder=str(dest_dir),
+                    servers_to_backup=[s],
+                )
+
+                # MUST be FAILED, NOT SUCCESS!
+                assert job.status == JobStatus.FAILED
+                rec = job.site_records[0]
+                assert rec.status == JobStatus.FAILED
+                assert "Connection reset by peer" in rec.error_message
+                assert "files.tar" in rec.error_message
+
+
+def test_coordinator_fails_when_private_files_verification_fails(mock_env):
+    """Job must FAIL if private files archive fails verification."""
+    db, dest_dir = mock_env
+
+    s = ServerConfig(host="server1.erp.com", site_name="riya-associate.com")
+    db.save_server(s)
+
+    coordinator = BackupCoordinator(db=db)
+
+    with patch("src.services.backup_coordinator.SSHService") as MockSSH:
+        mock_ssh = MagicMock()
+        mock_ssh.config = s
+        mock_ssh.connect.return_value = (True, "Connected")
+        MockSSH.return_value = mock_ssh
+
+        with patch("src.services.backup_coordinator.FrappeBackupService") as MockFrappe:
+            mock_frappe = MagicMock()
+            arts = [
+                BackupArtifact(
+                    filename="20261014_181143-riya-associate_com-database.sql.gz",
+                    artifact_type="database",
+                    remote_path="/bench/sites/riya-associate.com/private/backups/db.sql.gz",
+                    size_bytes=1000,
+                ),
+                BackupArtifact(
+                    filename="20261014_181143-riya-associate_com-private-files.tar",
+                    artifact_type="private_files",
+                    remote_path="/bench/sites/riya-associate.com/private/backups/private-files.tar",
+                    size_bytes=2000,
+                ),
+            ]
+            mock_frappe.run_backup.return_value = (True, "Backup OK", arts)
+            MockFrappe.return_value = mock_frappe
+
+            with patch("src.services.backup_coordinator.FileTransferService") as MockTransfer:
+                mock_transfer = MagicMock()
+
+                def fake_dl(artifact, destination_dir, progress_cb=None):
+                    lf = destination_dir / artifact.filename
+                    lf.write_bytes(b"x" * artifact.size_bytes)
+                    artifact.local_path = str(lf)
+                    artifact.status = "downloaded"
+                    return True
+
+                mock_transfer.download_artifact.side_effect = fake_dl
+                MockTransfer.return_value = mock_transfer
+
+                with patch("src.services.backup_coordinator.VerificationService") as MockVerifier:
+                    mock_verifier_inst = MagicMock()
+
+                    def fake_verify(art):
+                        if art.artifact_type == "private_files":
+                            art.verified = False
+                            art.error_message = "SHA-256 hash mismatch! Local: aaa vs Remote: bbb"
+                            return False
+                        art.verified = True
+                        art.sha256_hash = "abc123hash"
+                        return True
+
+                    mock_verifier_inst.verify_artifact.side_effect = fake_verify
+                    MockVerifier.return_value = mock_verifier_inst
+
+                    job = coordinator.run_backup_job(
+                        destination_folder=str(dest_dir),
+                        servers_to_backup=[s],
+                    )
+
+                    # MUST be FAILED, NOT SUCCESS!
+                    assert job.status == JobStatus.FAILED
+                    rec = job.site_records[0]
+                    assert rec.status == JobStatus.FAILED
+                    assert "hash mismatch" in rec.error_message
+                    assert "private-files.tar" in rec.error_message
+
+
+def test_crash_recovery_marks_interrupted_jobs_and_sites(mock_env):
+    """Ensure abnormal termination leaves jobs and site records marked as INTERRUPTED."""
+    from src.models.backup_job import BackupJob, SiteJobRecord
+    db, dest_dir = mock_env
+
+    job = BackupJob(
+        destination_path=str(dest_dir),
+        status=JobStatus.RUNNING,
+    )
+    rec = SiteJobRecord(
+        job_id=job.id,
+        site_name="riya-associate.com",
+        status=JobStatus.RUNNING,
+    )
+    job.site_records.append(rec)
+    db.save_job(job)
+
+    # Trigger recovery
+    db.recover_interrupted_jobs()
+
+    recovered_job = db.get_job_by_id(job.id)
+    assert recovered_job is not None
+    assert recovered_job.status == JobStatus.INTERRUPTED
+    assert "terminated unexpectedly" in (recovered_job.error_summary or "")
+
+    recovered_site = recovered_job.site_records[0]
+    assert recovered_site.status == JobStatus.INTERRUPTED

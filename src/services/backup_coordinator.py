@@ -250,10 +250,13 @@ class BackupCoordinator:
                     progress_cb=self.progress_cb,
                 )
                 if not ok:
+                    err = artifact.error_message or "Unknown transfer error"
+                    if artifact.filename not in err:
+                        err = f"Download failed for {artifact.filename}: {err}"
                     self._fail_site(
                         record,
                         stage=BackupStage.DOWNLOADING_FILES,
-                        error_msg=artifact.error_message or f"Download failed for {artifact.filename}",
+                        error_msg=err,
                         action="Check network stability and destination SSD write permissions.",
                     )
                     return
@@ -265,10 +268,13 @@ class BackupCoordinator:
                 self.log(f"[{site_name}] Verifying SHA-256 integrity for {artifact.filename}...")
                 verified = verifier.verify_artifact(artifact)
                 if not verified:
+                    err = artifact.error_message or "Unknown verification error"
+                    if artifact.filename not in err:
+                        err = f"Verification failed for {artifact.filename}: {err}"
                     self._fail_site(
                         record,
                         stage=BackupStage.VERIFYING_INTEGRITY,
-                        error_msg=artifact.error_message or f"Verification failed for {artifact.filename}",
+                        error_msg=err,
                         action="File integrity check failed. The downloaded file may be corrupted.",
                     )
                     return
@@ -282,6 +288,18 @@ class BackupCoordinator:
                 server_host=server_config.host,
                 artifacts=record.artifacts,
             )
+
+            has_db = any(a.artifact_type == "database" and a.verified for a in record.artifacts)
+            has_files = any(a.artifact_type == "files" and a.verified for a in record.artifacts)
+            has_priv = any(a.artifact_type == "private_files" and a.verified for a in record.artifacts)
+            has_cfg = any(a.artifact_type == "config" and a.verified for a in record.artifacts)
+
+            if has_db and has_files and has_priv and has_cfg:
+                record.diagnostics = "Full backup complete: Database, Config, Public Files, and Private Files verified."
+            elif has_db and not (has_files or has_priv):
+                record.diagnostics = "Database backup verified. No public or private files archives were produced by the server."
+            else:
+                record.diagnostics = f"Backup completed with {len(record.artifacts)} verified artifact(s)."
 
             record.status = JobStatus.SUCCESS
             record.backup_stage = BackupStage.COMPLETED

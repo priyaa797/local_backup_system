@@ -91,6 +91,14 @@ class FrappeBackupService:
             logger.error(msg)
             return False, msg, []
 
+        # Check if any expected artifact was missing
+        missing = [a for a in artifacts if a.status == "failed"]
+        if missing:
+            missing_names = ", ".join(a.filename for a in missing)
+            msg = f"Expected backup artifact(s) reported by bench were missing from remote server: {missing_names}"
+            logger.error(msg)
+            return False, msg, artifacts
+
         if log_cb:
             log_cb(f"[{site_name}] Discovered {len(artifacts)} backup artifact(s) totaling {sum(a.size_bytes for a in artifacts)} bytes.")
 
@@ -105,90 +113,193 @@ class FrappeBackupService:
     ) -> List[BackupArtifact]:
         """Identify backup artifacts from bench output and remote backups directory."""
         artifacts: List[BackupArtifact] = []
-        found_filenames: set[str] = set()
+        stdout_filenames: set[str] = set()
+        stdout_label_map: dict[str, str] = {}
+        stdout_path_map: dict[str, str] = {}
 
         # Remote backup directory in Frappe
         remote_backups_dir = f"{bench_dir}/sites/{site_name}/private/backups"
 
-        # 1. Parse standard Frappe output patterns:
-        # e.g.:
-        # Database : ./sites/site1.local/private/backups/20261014_114000-site1_local-database.sql.gz
-        # Public Files : ./sites/site1.local/private/backups/20261014_114000-site1_local-files.tar
-        # Private Files : ./sites/site1.local/private/backups/20261014_114000-site1_local-private-files.tar
-        lines = stdout.splitlines()
-        for line in lines:
-            line_stripped = line.strip()
-            # Match Database / Files / Config paths
-            match = re.search(r"(?:Database|Public Files|Private Files|Backup Config)\s*:\s*(\S+)", line_stripped, re.IGNORECASE)
+        # 1. Parse Frappe backup command output
+        # Strip ANSI escape codes if present
+        clean_stdout = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", stdout or "")
+
+        # Regex to match label : path lines from various Frappe versions:
+        # Config   : ./sites/site1.local/private/backups/...
+        # Database : ./sites/site1.local/private/backups/...
+        # Public   : ./sites/site1.local/private/backups/...
+        # Private  : ./sites/site1.local/private/backups/...
+        # Backup Config : ...
+        # Site Config   : ...
+        # Public Files  : ...
+        # Private Files : ...
+        # Files         : ...
+        label_re = re.compile(
+            r"^\s*(?:\*\*\*\s*)?(Database|DB|Public(?:\s+Files)?|Private(?:\s+Files)?|Files|(?:Site\s+|Backup\s+)?Config(?:\s+Backup)?)\s*:\s*(\S+)",
+            re.IGNORECASE,
+        )
+        path_re = re.compile(
+            r"(?:^|\s)(?:(?:\.?/)?(?:sites/[^/\s]+/)?private/backups/(\S+))",
+            re.IGNORECASE,
+        )
+
+        for line in clean_stdout.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+
+            match = label_re.search(line_str)
             if match:
-                raw_path = match.group(1).strip()
-                # Clean up relative prefix ./ if present
+                label = match.group(1).strip()
+                raw_path = match.group(2).strip()
                 clean_path = raw_path.lstrip("./")
                 if not clean_path.startswith("/"):
                     clean_path = f"{bench_dir}/{clean_path}"
 
                 fname = PurePosixPath(clean_path).name
-                found_filenames.add(fname)
+                stdout_filenames.add(fname)
+                stdout_label_map[fname] = label
+                stdout_path_map[fname] = clean_path
+            else:
+                pmatch = path_re.search(line_str)
+                if pmatch:
+                    raw_candidate = pmatch.group(1).strip()
+                    fname = PurePosixPath(raw_candidate).name
+                    if fname.endswith((".sql.gz", ".sql", ".tar", ".tgz", ".tar.gz", ".json")):
+                        stdout_filenames.add(fname)
+                        if fname not in stdout_path_map:
+                            stdout_path_map[fname] = f"{remote_backups_dir}/{fname}"
 
-        # 2. Inspect the remote directory using SFTP to get exact file sizes and discover any companion files (e.g. site_config)
+        # Extract backup run timestamp prefix (e.g. 20261014_181143)
+        run_timestamp_prefix: Optional[str] = None
+        for fn in stdout_filenames:
+            m = re.match(r"^(\d{8}_\d{6})", fn)
+            if m:
+                run_timestamp_prefix = m.group(1)
+                break
+
+        # 2. Inspect remote backup directory via SFTP
         try:
             sftp = self.ssh.open_sftp()
             try:
                 file_attrs = sftp.listdir_attr(remote_backups_dir)
                 # Sort newest first by mtime
                 file_attrs.sort(key=lambda a: a.st_mtime or 0, reverse=True)
+                attr_by_name = {a.filename: a for a in file_attrs}
 
-                if found_filenames:
-                    # Filter matching discovered filenames
+                # If timestamp prefix was not discovered from stdout, inspect newest database in directory
+                latest_db_mtime: Optional[float] = None
+                if not run_timestamp_prefix and file_attrs:
+                    latest_db_attr = next(
+                        (
+                            a
+                            for a in file_attrs
+                            if "database" in a.filename.lower()
+                            or a.filename.lower().endswith((".sql.gz", ".sql"))
+                        ),
+                        None,
+                    )
+                    if latest_db_attr:
+                        pm = re.match(r"^(\d{8}_\d{6})", latest_db_attr.filename)
+                        if pm:
+                            run_timestamp_prefix = pm.group(1)
+                        else:
+                            latest_db_mtime = float(latest_db_attr.st_mtime or 0)
+
+                # Determine candidate files belonging to this backup run
+                candidate_names: set[str] = set()
+
+                # Add all files matching the run timestamp prefix (e.g. 20261014_181143-*)
+                if run_timestamp_prefix:
                     for attr in file_attrs:
-                        if attr.filename in found_filenames:
-                            full_remote = f"{remote_backups_dir}/{attr.filename}"
-                            art = self._classify_artifact(attr.filename, full_remote, attr.st_size or 0)
-                            artifacts.append(art)
-                else:
-                    # Fallback if bench stdout didn't print standard paths (e.g. customized bench output)
-                    # Pick the latest database file and files from the last 15 minutes
-                    logger.info("Parsing stdout yielded no paths; inspecting %s directly", remote_backups_dir)
-                    if file_attrs:
-                        # Find the newest database file
-                        latest_db_attr = next(
-                            (a for a in file_attrs if "database" in a.filename and (a.filename.endswith(".sql.gz") or a.filename.endswith(".sql"))),
-                            None,
-                        )
-                        if latest_db_attr:
-                            # Extract timestamp prefix (e.g. 20261014_114000)
-                            prefix_match = re.match(r"^(\d{8}_\d{6})", latest_db_attr.filename)
-                            prefix = prefix_match.group(1) if prefix_match else ""
+                        if attr.filename.startswith(run_timestamp_prefix):
+                            candidate_names.add(attr.filename)
+                elif latest_db_mtime is not None:
+                    for attr in file_attrs:
+                        if abs((attr.st_mtime or 0) - latest_db_mtime) <= 120:
+                            candidate_names.add(attr.filename)
 
-                            for attr in file_attrs:
-                                if prefix and attr.filename.startswith(prefix):
-                                    full_remote = f"{remote_backups_dir}/{attr.filename}"
-                                    art = self._classify_artifact(attr.filename, full_remote, attr.st_size or 0)
-                                    artifacts.append(art)
-                                elif not prefix and (attr.st_mtime or 0) >= (latest_db_attr.st_mtime or 0) - 60:
-                                    # Within 1 minute of DB creation
-                                    full_remote = f"{remote_backups_dir}/{attr.filename}"
-                                    art = self._classify_artifact(attr.filename, full_remote, attr.st_size or 0)
-                                    artifacts.append(art)
+                # Add all files explicitly reported in bench stdout
+                for fname in stdout_filenames:
+                    candidate_names.add(fname)
+
+                # Build artifact objects
+                for fname in candidate_names:
+                    full_remote = stdout_path_map.get(fname, f"{remote_backups_dir}/{fname}")
+                    if fname in attr_by_name:
+                        attr = attr_by_name[fname]
+                        art = self._classify_artifact(
+                            filename=attr.filename,
+                            remote_path=full_remote,
+                            size=attr.st_size or 0,
+                            label=stdout_label_map.get(attr.filename),
+                        )
+                    else:
+                        logger.error(
+                            "Expected backup artifact %s reported by bench was not found in %s",
+                            fname,
+                            remote_backups_dir,
+                        )
+                        art = self._classify_artifact(
+                            filename=fname,
+                            remote_path=full_remote,
+                            size=0,
+                            label=stdout_label_map.get(fname),
+                        )
+                        art.status = "failed"
+                        art.error_message = (
+                            f"Remote backup artifact '{fname}' reported by bench was not found on server."
+                        )
+                    artifacts.append(art)
 
             finally:
                 sftp.close()
         except Exception as exc:
-            logger.warning("Error inspecting remote backup directory %s via SFTP: %s", remote_backups_dir, exc)
+            logger.warning(
+                "Error inspecting remote backup directory %s via SFTP: %s",
+                remote_backups_dir,
+                exc,
+            )
 
+        # Sort canonically: config -> database -> files -> private_files -> other
+        type_priority = {
+            "config": 0,
+            "database": 1,
+            "files": 2,
+            "private_files": 3,
+            "other": 4,
+        }
+        artifacts.sort(key=lambda a: (type_priority.get(a.artifact_type, 99), a.filename))
         return artifacts
 
     @staticmethod
-    def _classify_artifact(filename: str, remote_path: str, size: int) -> BackupArtifact:
-        """Determine artifact type from filename."""
+    def _classify_artifact(
+        filename: str,
+        remote_path: str,
+        size: int,
+        label: Optional[str] = None,
+    ) -> BackupArtifact:
+        """Determine artifact type from bench output label or filename patterns."""
+        lbl_lower = (label or "").strip().lower()
         fn_lower = filename.lower()
-        if "database" in fn_lower:
+
+        if lbl_lower in ("database", "db"):
             art_type = "database"
-        elif "private-files" in fn_lower or "private_files" in fn_lower:
-            art_type = "private_files"
-        elif "files" in fn_lower:
+        elif lbl_lower in ("public", "public files", "files"):
             art_type = "files"
-        elif "site_config" in fn_lower or fn_lower.endswith(".json"):
+        elif lbl_lower in ("private", "private files"):
+            art_type = "private_files"
+        elif "config" in lbl_lower:
+            art_type = "config"
+        elif "database" in fn_lower or fn_lower.endswith((".sql.gz", ".sql", ".sql.bz2", ".sql.xz")):
+            art_type = "database"
+        elif "private-files" in fn_lower or "private_files" in fn_lower or (
+            "private" in fn_lower and ("file" in fn_lower or fn_lower.endswith((".tar", ".tgz", ".tar.gz")))
+        ):
+            art_type = "private_files"
+        elif "files" in fn_lower or "public" in fn_lower or fn_lower.endswith((".tar", ".tgz", ".tar.gz")):
+            art_type = "files"
+        elif "site_config" in fn_lower or "config" in fn_lower or fn_lower.endswith(".json"):
             art_type = "config"
         else:
             art_type = "other"

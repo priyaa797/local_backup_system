@@ -15,7 +15,7 @@ from typing import Any, Generator, List, Optional
 import uuid
 
 from src.models.backup_artifact import BackupArtifact
-from src.models.backup_job import BackupJob, JobStatus, SiteJobRecord
+from src.models.backup_job import BackupJob, BackupStage, JobStatus, SiteJobRecord
 from src.models.server_config import ServerConfig
 from src.storage.app_paths import get_db_path
 from src.utils.logger import get_logger
@@ -152,7 +152,7 @@ class Database:
         self.recover_interrupted_jobs()
 
     def recover_interrupted_jobs(self) -> None:
-        """Mark any jobs left in 'running' or 'pending' state as 'interrupted'."""
+        """Mark any jobs and site records left in 'running' or 'pending' state as 'interrupted'."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -168,10 +168,29 @@ class Database:
                     JobStatus.PENDING,
                 ),
             )
-            if cursor.rowcount > 0:
+            jobs_recovered = cursor.rowcount
+
+            cursor.execute(
+                """
+                UPDATE job_sites
+                SET status = ?, backup_stage = ?, error_message = ?
+                WHERE status IN (?, ?)
+                """,
+                (
+                    JobStatus.INTERRUPTED,
+                    BackupStage.FAILED,
+                    "Application terminated unexpectedly while site backup was active.",
+                    JobStatus.RUNNING,
+                    JobStatus.PENDING,
+                ),
+            )
+            sites_recovered = cursor.rowcount
+
+            if jobs_recovered > 0 or sites_recovered > 0:
                 logger.warning(
-                    "Recovered %d interrupted job(s) from previous abnormal termination.",
-                    cursor.rowcount,
+                    "Recovered %d interrupted job(s) and %d site record(s) from previous abnormal termination.",
+                    jobs_recovered,
+                    sites_recovered,
                 )
 
     # --- Server Config CRUD ---

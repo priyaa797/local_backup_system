@@ -41,7 +41,7 @@ class VerificationService:
             return None
         try:
             cmd = f"sha256sum '{remote_path}'"
-            exit_code, stdout, stderr = self.ssh.execute_command(cmd, timeout=60)
+            exit_code, stdout, stderr = self.ssh.execute_command(cmd, timeout=300)
             if exit_code == 0 and stdout:
                 parts = stdout.strip().split()
                 if parts:
@@ -98,6 +98,19 @@ class VerificationService:
     ) -> Path:
         """Write backup_manifest.json with all artifacts and integrity metadata."""
         manifest_path = site_folder / "backup_manifest.json"
+        has_database = any(a.artifact_type == "database" and a.verified for a in artifacts)
+        has_files = any(a.artifact_type == "files" and a.verified for a in artifacts)
+        has_private_files = any(a.artifact_type == "private_files" and a.verified for a in artifacts)
+        has_config = any(a.artifact_type == "config" and a.verified for a in artifacts)
+        is_complete_with_files = has_database and has_files and has_private_files and has_config
+
+        if is_complete_with_files:
+            backup_type = "full"
+        elif has_database and not (has_files or has_private_files):
+            backup_type = "database_only"
+        else:
+            backup_type = "custom"
+
         manifest_data = {
             "version": "1.0",
             "job_id": job_id,
@@ -106,7 +119,13 @@ class VerificationService:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "total_artifacts": len(artifacts),
             "total_bytes": sum(a.size_bytes for a in artifacts),
-            "all_verified": all(a.verified for a in artifacts),
+            "all_verified": all(a.verified for a in artifacts) and len(artifacts) > 0,
+            "has_database": has_database,
+            "has_files": has_files,
+            "has_private_files": has_private_files,
+            "has_config": has_config,
+            "is_complete_with_files": is_complete_with_files,
+            "backup_type": backup_type,
             "artifacts": [
                 {
                     "filename": a.filename,
@@ -122,3 +141,15 @@ class VerificationService:
         manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
         logger.info("Written backup manifest to %s", manifest_path)
         return manifest_path
+
+    @staticmethod
+    def read_manifest(site_folder: Path) -> Optional[dict]:
+        """Read and parse backup_manifest.json from site directory."""
+        manifest_path = site_folder / "backup_manifest.json"
+        if not manifest_path.exists():
+            return None
+        try:
+            return json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Could not read manifest at %s: %s", manifest_path, exc)
+            return None

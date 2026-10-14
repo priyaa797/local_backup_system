@@ -15,6 +15,7 @@ import paramiko
 
 from src.models.backup_artifact import BackupArtifact
 from src.services.ssh_service import SSHService
+from src.utils.formatters import sanitize_filename
 from src.utils.logger import get_logger
 
 logger = get_logger()
@@ -39,7 +40,7 @@ class FileTransferService:
         artifact: BackupArtifact,
         destination_dir: Path,
         progress_cb: Optional[ProgressCallback] = None,
-        chunk_size: int = 65536,  # 64 KB
+        chunk_size: int = 262144,  # 256 KB
     ) -> bool:
         """Download remote artifact to local destination_dir.
 
@@ -48,8 +49,9 @@ class FileTransferService:
         self._cancel_requested = False
         destination_dir.mkdir(parents=True, exist_ok=True)
 
-        final_local_path = destination_dir / artifact.filename
-        part_local_path = destination_dir / f"{artifact.filename}.part"
+        safe_filename = sanitize_filename(artifact.filename)
+        final_local_path = destination_dir / safe_filename
+        part_local_path = destination_dir / f"{safe_filename}.part"
 
         # Remove previous leftover .part file if any
         if part_local_path.exists():
