@@ -60,45 +60,61 @@ def test_coordinator_full_success_run(mock_env):
 
     coordinator = BackupCoordinator(db=db)
 
-    # Mock SSH Service
+    # 1. Mock SSH Service per server
     with patch("src.services.backup_coordinator.SSHService") as MockSSH:
-        mock_ssh_inst = MagicMock()
-        MockSSH.return_value = mock_ssh_inst
-        mock_ssh_inst.connect.return_value = (True, "Connected")
+        def ssh_side_effect(cfg, auto_accept_new_host_keys=True):
+            mock_inst = MagicMock()
+            mock_inst.config = cfg
+            mock_inst.connect.return_value = (True, "Connected")
+            mock_inst.execute_command.return_value = (1, "", "")
+            return mock_inst
 
-        # Mock Frappe backup service discovery
+        MockSSH.side_effect = ssh_side_effect
+
+        # 2. Mock Frappe backup service discovery per server
         with patch("src.services.backup_coordinator.FrappeBackupService") as MockFrappe:
-            mock_frappe_inst = MagicMock()
-            MockFrappe.return_value = mock_frappe_inst
+            def frappe_side_effect(ssh, server_config):
+                mock_inst = MagicMock()
+                mock_inst.ssh = ssh
+                mock_inst.config = server_config
+                site = server_config.site_name
+                payload_len = 1200
 
-            def fake_run_backup(log_cb=None, timeout_seconds=600):
-                site = mock_frappe_inst.config.site_name
-                arts = [
-                    BackupArtifact(
-                        filename=f"20261014_114000-{site}-database.sql.gz",
-                        artifact_type="database",
-                        remote_path=f"/bench/sites/{site}/private/backups/20261014_114000-{site}-database.sql.gz",
-                        size_bytes=1024,
-                    )
-                ]
-                return True, "Backup OK", arts
+                def fake_run_backup(log_cb=None, timeout_seconds=600):
+                    arts = [
+                        BackupArtifact(
+                            filename=f"20261014_114000-{site}-database.sql.gz",
+                            artifact_type="database",
+                            remote_path=f"/bench/sites/{site}/private/backups/20261014_114000-{site}-database.sql.gz",
+                            size_bytes=payload_len,
+                        )
+                    ]
+                    return True, "Backup OK", arts
 
-            mock_frappe_inst.run_backup.side_effect = fake_run_backup
+                mock_inst.run_backup.side_effect = fake_run_backup
+                return mock_inst
 
-            # Mock File Transfer Service
+            MockFrappe.side_effect = frappe_side_effect
+
+            # 3. Mock File Transfer Service
             with patch("src.services.backup_coordinator.FileTransferService") as MockTransfer:
-                mock_transfer_inst = MagicMock()
-                MockTransfer.return_value = mock_transfer_inst
+                def transfer_side_effect(ssh):
+                    mock_inst = MagicMock()
+                    mock_inst.ssh = ssh
 
-                def fake_download(artifact, destination_dir, progress_cb=None):
-                    local_f = destination_dir / artifact.filename
-                    local_f.write_bytes(b"dummy sql backup payload" * 50)
-                    artifact.local_path = str(local_f)
-                    artifact.size_bytes = local_f.stat().st_size
-                    artifact.status = "downloaded"
-                    return True
+                    def fake_download(artifact, destination_dir, progress_cb=None):
+                        local_f = destination_dir / artifact.filename
+                        payload = b"dummy sql backup payload" * 50  # 24 * 50 = 1200 bytes
+                        local_f.write_bytes(payload)
+                        artifact.local_path = str(local_f)
+                        artifact.size_bytes = len(payload)
+                        artifact.status = "downloaded"
+                        return True
 
-                mock_transfer_inst.download_artifact.side_effect = fake_download
+                    mock_inst.download_artifact.side_effect = fake_download
+                    return mock_inst
+
+                MockTransfer.side_effect = transfer_side_effect
 
                 # Execute Job
                 job = coordinator.run_backup_job(
@@ -110,6 +126,22 @@ def test_coordinator_full_success_run(mock_env):
                 assert job.total_sites == 2
                 assert job.success_sites == 2
                 assert job.failed_sites == 0
+
+                # Validate site 1 records and manifest
+                s1_rec = next(s for s in job.site_records if s.site_name == "riya-associate.com")
+                assert s1_rec.status == JobStatus.SUCCESS
+                assert len(s1_rec.artifacts) == 1
+                assert "riya-associate.com" in s1_rec.artifacts[0].filename
+                assert Path(s1_rec.artifacts[0].local_path).exists()
+                assert (Path(s1_rec.download_dir) / "backup_manifest.json").exists()
+
+                # Validate site 2 records and manifest
+                s2_rec = next(s for s in job.site_records if s.site_name == "second-site.org")
+                assert s2_rec.status == JobStatus.SUCCESS
+                assert len(s2_rec.artifacts) == 1
+                assert "second-site.org" in s2_rec.artifacts[0].filename
+                assert Path(s2_rec.artifacts[0].local_path).exists()
+                assert (Path(s2_rec.download_dir) / "backup_manifest.json").exists()
 
                 # Check database record
                 db_job = db.get_job_by_id(job.id)
@@ -129,43 +161,55 @@ def test_coordinator_partial_success_run(mock_env):
     with patch("src.services.backup_coordinator.SSHService") as MockSSH:
         def ssh_side_effect(cfg, auto_accept_new_host_keys=True):
             mock_inst = MagicMock()
+            mock_inst.config = cfg
             if cfg.host == "broken-server.com":
                 mock_inst.connect.return_value = (False, "Network connection timed out.")
             else:
                 mock_inst.connect.return_value = (True, "Connected")
+                mock_inst.execute_command.return_value = (1, "", "")
             return mock_inst
 
         MockSSH.side_effect = ssh_side_effect
 
         with patch("src.services.backup_coordinator.FrappeBackupService") as MockFrappe:
-            mock_frappe_inst = MagicMock()
-            MockFrappe.return_value = mock_frappe_inst
-            mock_frappe_inst.run_backup.return_value = (
-                True,
-                "OK",
-                [
-                    BackupArtifact(
-                        filename="20261014_114000-site1.com-database.sql.gz",
-                        artifact_type="database",
-                        remote_path="/path/db.sql.gz",
-                        size_bytes=500,
-                    )
-                ],
-            )
+            def frappe_side_effect(ssh, server_config):
+                mock_inst = MagicMock()
+                mock_inst.ssh = ssh
+                mock_inst.config = server_config
+                site = server_config.site_name
+                mock_inst.run_backup.return_value = (
+                    True,
+                    "OK",
+                    [
+                        BackupArtifact(
+                            filename=f"20261014_114000-{site}-database.sql.gz",
+                            artifact_type="database",
+                            remote_path=f"/path/{site}-db.sql.gz",
+                            size_bytes=500,
+                        )
+                    ],
+                )
+                return mock_inst
+
+            MockFrappe.side_effect = frappe_side_effect
 
             with patch("src.services.backup_coordinator.FileTransferService") as MockTransfer:
-                mock_transfer_inst = MagicMock()
-                MockTransfer.return_value = mock_transfer_inst
+                def transfer_side_effect(ssh):
+                    mock_inst = MagicMock()
+                    mock_inst.ssh = ssh
 
-                def fake_dl(artifact, destination_dir, progress_cb=None):
-                    lf = destination_dir / artifact.filename
-                    lf.write_bytes(b"data" * 125)  # 500 bytes
-                    artifact.local_path = str(lf)
-                    artifact.size_bytes = 500
-                    artifact.status = "downloaded"
-                    return True
+                    def fake_dl(artifact, destination_dir, progress_cb=None):
+                        lf = destination_dir / artifact.filename
+                        lf.write_bytes(b"data" * 125)  # 500 bytes
+                        artifact.local_path = str(lf)
+                        artifact.size_bytes = 500
+                        artifact.status = "downloaded"
+                        return True
 
-                mock_transfer_inst.download_artifact.side_effect = fake_dl
+                    mock_inst.download_artifact.side_effect = fake_dl
+                    return mock_inst
+
+                MockTransfer.side_effect = transfer_side_effect
 
                 job = coordinator.run_backup_job(
                     destination_folder=str(dest_dir),
